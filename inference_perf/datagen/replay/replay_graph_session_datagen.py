@@ -59,6 +59,7 @@ from inference_perf.apis.anthropic_messages import (
 )
 from inference_perf.apis.chat import ChatMessage, reasoning_field
 from inference_perf.apis.image_parts import base64_size, image_bytes, is_image_part, to_otel_part
+from inference_perf.apis.response_errors import InBandError, in_band_error
 from inference_perf.payloads import Image, Images, RequestMetrics, Text
 from inference_perf.apis.streaming_parser import parse_sse_stream
 from inference_perf.config import APIConfig, APIType, DataConfig, SessionReplayConfig
@@ -517,9 +518,7 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
                     f"overwriting with replay-enforced value."
                 )
             names = self.expected_output_tool_names or []
-            # Build available set from self.tool_definitions (the raw list). The name
-            # field is set explicitly in to_request_body and is NOT passed through
-            # _clean_parameters, so it survives schema cleaning unchanged.
+            # Build available set from self.tool_definitions (the raw list).
             available = {t["name"] for t in self.tool_definitions if "name" in t}
             if len(names) == 1 and names[0] in available:
                 # Force the exact function the original trace recorded. This maximises
@@ -1174,6 +1173,9 @@ class SessionChatCompletionAPIData(ChatCompletionAPIData):
             actual_tool_names = [tool_call_chunks[i]["function"]["name"] for i in sorted(tool_call_chunks)]
         else:
             data = await response.json()
+            # A 200 whose body is an error payload is that error, not a success.
+            if (error_payload := in_band_error(data)) is not None:
+                raise InBandError(error_payload)
             server_usage = data.get("usage")
             prompt_len = self._resolve_prompt_tokens(server_usage, tokenizer)
             choices = data.get("choices", [])
@@ -1367,6 +1369,9 @@ class SessionAnthropicMessagesAPIData(SessionChatCompletionAPIData):
             )
         else:
             data = await response.json()
+            # A 200 whose body is an error payload is that error, not a success.
+            if (error_payload := in_band_error(data)) is not None:
+                raise InBandError(error_payload)
             usage = data.get("usage") or {}
             output_text, output_message = parse_anthropic_content(data.get("content"))
             input_tokens = usage.get("input_tokens")
@@ -1484,12 +1489,13 @@ class ReplayGraphSessionGeneratorBase(SessionGenerator, LazyLoadDataMixin):
         super().__init__(api_config, config, tokenizer)
         self.config = config
         self.replay_config = replay_config
-        self.mp_manager = mp_manager
         self.num_workers = max(1, num_workers)
         self.base_seed = base_seed if base_seed is not None else 42
 
         self.output_registry = EventOutputRegistry()
         self.worker_tracker = WorkerSessionTracker()
+        # Keep only the queue proxy. Workers receive this datagen by pickle and the
+        # manager itself does not pickle.
         if mp_manager is not None:
             self.session_completion_queue: Any = mp_manager.Queue()
         else:

@@ -143,6 +143,10 @@ class APIConfig(StrictBaseModel):
     session_id_header_key: Optional[str] = Field(
         default=None, description="Header used to send the session ID with each request in multi-turn benchmarks."
     )
+    clean_tool_schemas: bool = Field(
+        default=False,
+        description="Rewrite tool parameter schemas into the subset strict servers accept (e.g. vLLM with xgrammar): drop keys such as 'default' and 'title', collapse anyOf/oneOf, coerce object-valued additionalProperties to false. Changes the prompt; use only when the server rejects the recorded schemas.",
+    )
     # Response header carrying a server-assigned session token (e.g. x-session-token
     # from the llm-d-router session affinity plugin). When set, the token received in
     # a session's response is echoed as a request header on subsequent requests of
@@ -150,6 +154,14 @@ class APIConfig(StrictBaseModel):
     session_token_header_key: Optional[str] = Field(
         default=None,
         description="Response header carrying a server-assigned session token, replayed as a request header on later requests of the same session to keep router session affinity.",
+    )
+    # Request header carrying a client-generated request ID (x-request-id by default,
+    # which vLLM uses to build its own request ID and proxies such as Envoy can log).
+    # The ID is generated before the request is sent, so a request that timed out or
+    # never got a response can still be found in server logs.
+    request_id_header_key: Optional[str] = Field(
+        default="x-request-id",
+        description="Header used to send a client-generated ID with each request, reported as request_id in per-request entries. An empty string turns this off; a request ID set through api.headers is still sent but not reported.",
     )
 
     @model_validator(mode="after")

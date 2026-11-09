@@ -23,22 +23,26 @@ from inference_perf.apis import (
     StreamedResponseMetrics,
 )
 from inference_perf.apis.anthropic_messages import ANTHROPIC_VERSION, parse_anthropic_content
+from inference_perf.apis.response_errors import InvalidResponseError
 from inference_perf.apis.streaming_parser import StreamInterruptedError
+from inference_perf.apis.tool_schema import clean_request_tool_schemas
 from inference_perf.payloads import RequestMetrics, Text
 from inference_perf.utils import CustomTokenizer
 from .base import ModelServerClient, ModelServerClientSession
 from .metrics import Metric, BaseMetrics
 from .otel_instrumentation import get_otel_instrumentation, summarize_media
-from typing import Iterator, List, Optional, Any, Dict, Tuple
+from typing import Iterator, List, Mapping, Optional, Any, Dict, Tuple
 import aiohttp
 import asyncio
 import random
+import re
 from asyncio import sleep
 import json
 import time
 import logging
 import requests
 import ssl
+import uuid
 
 
 logger = logging.getLogger(__name__)
@@ -47,6 +51,21 @@ logger = logging.getLogger(__name__)
 # is optional and defaults to None; an unresponsive server must not hang startup, so
 # the probe falls back to this bounded deadline.
 _SUPPORTED_MODELS_TIMEOUT_SEC = 30.0
+
+# Readiness wait: the pause between probes of the readiness route, and the cap on a
+# single probe so one hung connection cannot eat the whole readiness budget.
+_READINESS_POLL_INTERVAL_SEC = 1.0
+_READINESS_PROBE_TIMEOUT_SEC = 5.0
+# Probed when a profile names no readiness route of its own.
+_READINESS_FALLBACK_ROUTE = "/v1/models"
+
+# An SSE line may end in CRLF or a lone CR as well as LF. Normalizing to LF first lets
+# the patterns below anchor on ``^`` with ``re.MULTILINE``, which only breaks at LF.
+_SSE_LINE_ENDING = re.compile(r"\r\n?")
+# One event's data may span several ``data:`` lines, and those lines are consecutive,
+# since a blank line ends the event.
+_SSE_FIRST_DATA = re.compile(r"^data:.*(?:\ndata:.*)*", re.MULTILINE)
+_SSE_DATA_PREFIX = re.compile(r"^data: ?", re.MULTILINE)
 
 
 class OpenAIMetrics(BaseMetrics):
@@ -82,6 +101,11 @@ class OpenAIMetrics(BaseMetrics):
 class openAIModelServerClient(ModelServerClient):
     _session: "Optional[openAIModelServerClientSession]" = None
     _session_lock = asyncio.Lock()
+    # Route that answers 200 once the server can take requests. A profile without one
+    # probes _READINESS_FALLBACK_ROUTE instead.
+    readiness_route: Optional[str] = None
+    # Budget for the readiness wait. Profiles override it when their boot takes longer.
+    readiness_timeout_sec: float = 600.0
 
     def __init__(
         self,
@@ -126,6 +150,10 @@ class openAIModelServerClient(ModelServerClient):
         # object (main.py copies it back into the run config).
         tokenizer_config = tokenizer_config if tokenizer_config is not None else CustomTokenizerConfig()
         self.tokenizer_config = tokenizer_config
+
+        # Before the /v1/models probe below, so a server still loading its weights is
+        # waited for instead of failing model auto-detection.
+        self.wait_until_ready()
 
         supported_models: Optional[List[dict[str, Any]]] = None
         inferred_entry: Optional[dict[str, Any]] = None
@@ -260,6 +288,39 @@ class openAIModelServerClient(ModelServerClient):
     def get_prometheus_metric_metadata(self) -> OpenAIMetrics:
         raise NotImplementedError
 
+    def wait_until_ready(self) -> None:
+        """Poll the server's readiness route until it answers 200.
+
+        A profile without a readiness route probes ``/v1/models`` instead. A 404 means the
+        route is not served here, so the run carries on without waiting. Any other status
+        and any transport error count as not ready yet, for at most
+        ``readiness_timeout_sec``; the error raised at the deadline names the last one seen.
+        """
+        route = self.readiness_route if self.readiness_route is not None else _READINESS_FALLBACK_ROUTE
+        url = f"{self.uri}{route}"
+        headers = _build_request_headers(self.api_config, self.api_key)
+        cert = (self.cert_path, self.key_path) if self.cert_path and self.key_path else None
+        timeout = self.readiness_timeout_sec
+        deadline = time.monotonic() + timeout
+        last_seen = "no response"
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Exception(f"Server not ready: {url} did not answer 200 within {timeout}s (last: {last_seen})")
+            try:
+                response = requests.get(url, headers=headers, timeout=min(remaining, _READINESS_PROBE_TIMEOUT_SEC), cert=cert)
+                if response.status_code == 200:
+                    logger.info(f"Server ready: {url} answered 200")
+                    return
+                if response.status_code == 404:
+                    logger.info(f"Server does not serve {url}, starting without waiting for it")
+                    return
+                last_seen = f"HTTP {response.status_code}"
+            except requests.RequestException as e:
+                last_seen = f"{type(e).__name__}: {e}"
+            logger.debug(f"Waiting for {url}: {last_seen}")
+            time.sleep(min(_READINESS_POLL_INTERVAL_SEC, max(0.0, deadline - time.monotonic())))
+
     def get_supported_models(self) -> List[dict[str, Any]]:
         try:
             timeout = self.timeout if self.timeout is not None else _SUPPORTED_MODELS_TIMEOUT_SEC
@@ -288,6 +349,68 @@ def _update_headers_case_insensitive(target: dict[str, str], source: dict[str, s
         for mk in matching_keys:
             del target[mk]
         target[k] = v
+
+
+def _ensure_request_id(headers: dict[str, str], header_key: Optional[str]) -> Optional[str]:
+    """Return the request ID sent under ``header_key``, generating one if the headers lack it.
+
+    An ID already in the headers (set through ``api.headers`` or the data's own headers)
+    is kept and returned, so the report matches what went on the wire. An empty or None
+    ``header_key`` generates no ID and returns None.
+    """
+    if not header_key:
+        return None
+    for name, value in headers.items():
+        if name.lower() == header_key.lower():
+            return value
+    request_id = uuid.uuid4().hex
+    headers[header_key] = request_id
+    return request_id
+
+
+def _parse_response_body(body: str) -> Optional[dict[str, object]]:
+    """Parse a response body as a JSON object, or the first event of a streamed one.
+
+    A body that parses as JSON is not searched for an event, so a large unary body is
+    scanned once. A streamed event's ``data:`` lines are joined with newlines, as SSE
+    specifies. A body that is not a JSON object either way returns None.
+    """
+    try:
+        data = json.loads(body)
+    except ValueError:
+        first_event = _SSE_FIRST_DATA.search(_SSE_LINE_ENDING.sub("\n", body))
+        if first_event is None:
+            return None
+        try:
+            data = json.loads(_SSE_DATA_PREFIX.sub("", first_event.group()))
+        except ValueError:
+            return None
+    if not isinstance(data, dict):
+        return None
+    return data
+
+
+def _read_server_request_id(headers: Mapping[str, str], body: str) -> Optional[str]:
+    """Read the request ID the server reported, for servers that ignore the one sent.
+
+    Takes the top-level ``id`` of the response body (``chatcmpl-...`` from vLLM), which a
+    streamed body carries in its first event, nested under ``message`` in Anthropic's
+    ``message_start``. Falls back to the ``x-request-id`` response header. An integer ID
+    is kept as a string rather than failing the metric's validation.
+    """
+    candidates: list[object] = []
+    data = _parse_response_body(body)
+    if data is not None:
+        candidates.append(data.get("id"))
+        message = data.get("message")
+        if isinstance(message, dict):
+            candidates.append(message.get("id"))
+    candidates.append(headers.get("x-request-id"))
+    for candidate in candidates:
+        # bool is a subclass of int, so True would otherwise be reported as "True".
+        if isinstance(candidate, (str, int)) and not isinstance(candidate, bool) and str(candidate).strip():
+            return str(candidate).strip()
+    return None
 
 
 def _build_request_headers(api_config: APIConfig, api_key: Optional[str]) -> dict[str, str]:
@@ -574,6 +697,10 @@ class openAIModelServerClientSession(ModelServerClientSession):
             streaming=self.client.api_config.streaming,
         )
 
+        # Opt-in: rewrite tool schemas for servers that reject the recorded ones.
+        if self.client.api_config.clean_tool_schemas:
+            clean_request_tool_schemas(payload, self.client.api_config.type)
+
         # Add response_format for structured output if configured.
         if self.client.api_config.type != APIType.AnthropicMessages and self.client.api_config.response_format:
             payload["response_format"] = self.client.api_config.response_format.to_api_format()
@@ -597,6 +724,9 @@ class openAIModelServerClientSession(ModelServerClientSession):
             session_token = self._session_tokens.get(session_id)
             if session_token:
                 headers[session_token_header] = session_token
+
+        # Generated before the attempt loop, so every retry of this request carries the same ID.
+        request_id = _ensure_request_id(headers, self.client.api_config.request_id_header_key)
 
         request_data = json.dumps(payload)
 
@@ -734,6 +864,12 @@ class openAIModelServerClientSession(ModelServerClientSession):
                                     original_error = read_error.original
                                     if read_error.raw_content:
                                         response_content = read_error.raw_content
+                                # A 200 whose body is not a completion (an in-band
+                                # error payload, or no content and no usage) is
+                                # reported under its own type; the body it carries
+                                # is the evidence, so keep it as the response.
+                                elif isinstance(read_error, InvalidResponseError) and read_error.raw_content:
+                                    response_content = read_error.raw_content
                                 error = ErrorResponseInfo(
                                     error_msg=str(original_error),
                                     error_type=type(original_error).__name__,
@@ -846,6 +982,9 @@ class openAIModelServerClientSession(ModelServerClientSession):
         if data.graph_event_id:
             info.graph_event_id = data.graph_event_id
 
+        # Read before the embeddings body is stripped below, which drops its `id`.
+        server_request_id = _read_server_request_id(response.headers, response_content) if response is not None else None
+
         # Only a successful body is stripped. A failed one is kept whole because it
         # carries the server's error message, including a 200 recorded as a failure.
         if self.client.api_config.type == APIType.Embeddings and error is None:
@@ -855,6 +994,8 @@ class openAIModelServerClientSession(ModelServerClientSession):
             stage_id=stage_id,
             session_id=data.session_id if isinstance(data.session_id, str) else None,
             request_session_id=data.request_session_id if isinstance(data.request_session_id, str) else None,
+            request_id=request_id,
+            server_request_id=server_request_id,
             request_data=request_data,
             response_data=response_content,
             info=info,
